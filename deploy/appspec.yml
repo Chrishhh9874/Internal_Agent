@@ -1,0 +1,23 @@
+# CodeDeploy reads this from the root of bundle.zip.
+# It only maps lifecycle hooks to scripts; the image SHA lives in image.env.
+version: 0.0
+os: linux
+
+files:
+  - source: /
+    destination: /opt/internal-agent/deploy
+file_exists_behavior: OVERWRITE
+
+hooks:
+  AfterInstall:
+    - location: scripts/pull.sh
+      timeout: 300
+      runas: root
+  ApplicationStart:
+    - location: scripts/start.sh
+      timeout: 120
+      runas: root
+  ValidateService:
+    - location: scripts/validate.sh
+      timeout: 120
+      runas: root
