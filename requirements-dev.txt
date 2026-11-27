@@ -1,0 +1,4 @@
+# Test-only tools. Installed in the CI test job and locally, never in the image.
+-r requirements.txt
+pytest==9.2.0
+httpx==0.29.0
