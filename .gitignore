@@ -218,3 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Written by CI on each deploy; never committed
+deploy/image.env

@@ -1,0 +1,112 @@
+name: ci-cd
+
+# Pull requests: run tests, build the image and smoke-test it. Nothing is pushed.
+# Pushes to main (merges): the same, then push the image to ECR and upload the
+# deploy bundle to S3. The new S3 object version triggers CodePipeline.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    # Job-level permissions replace the top-level ones, so contents: read is repeated.
+    # id-token: write lets the job request the OIDC token used to assume the AWS role.
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      LOCAL_IMAGE: app:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build image
+        run: docker build -t "$LOCAL_IMAGE" .
+
+      - name: Smoke-test the container
+        run: |
+          docker run -d --name smoke -p 8000:8000 "$LOCAL_IMAGE"
+          for i in $(seq 1 10); do
+            if curl -fsS http://localhost:8000/api/health; then
+              echo
+              echo "healthy"
+              exit 0
+            fi
+            echo "not ready yet ($i/10)"
+            sleep 3
+          done
+          echo "smoke test failed"
+          docker logs --tail 50 smoke
+          exit 1
+
+      # Everything below runs only on a merge to main.
+      # The role's trust policy also rejects pull request tokens.
+
+      - name: Check repository variables
+        if: github.event_name == 'push'
+        env:
+          AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+          BUNDLE_BUCKET: ${{ vars.BUNDLE_BUCKET }}
+        run: |
+          # An unset variable silently becomes an empty string; fail early and clearly instead.
+          missing=0
+          for name in AWS_ROLE_ARN AWS_REGION ECR_REPOSITORY BUNDLE_BUCKET; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Repository variable $name is not set"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Configure AWS credentials
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: github.event_name == 'push'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push image and write image.env
+        if: github.event_name == 'push'
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          docker tag "$LOCAL_IMAGE" "$IMAGE"
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" > deploy/image.env
+          cat deploy/image.env
+
+      - name: Upload bundle to S3
+        if: github.event_name == 'push'
+        run: |
+          # Zip from inside deploy/ so appspec.yml sits at the root of the zip.
+          cd deploy
+          zip -r ../bundle.zip .
+          aws s3 cp ../bundle.zip "s3://${{ vars.BUNDLE_BUCKET }}/bundle.zip"
