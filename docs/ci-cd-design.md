@@ -486,7 +486,7 @@ Trust policy:
     "Condition": {
       "StringEquals": {
         "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-        "token.actions.githubusercontent.com:sub": "repo:<owner>/<repo>:ref:refs/heads/main"
+        "token.actions.githubusercontent.com:sub": "<sub-prefix>:ref:refs/heads/main"
       }
     }
   }]
@@ -494,8 +494,12 @@ Trust policy:
 ```
 
 - The `sub` condition is mandatory. GitHub's OIDC provider is shared by every GitHub user, so checking only `aud` would let any repository's workflow assume this role.
-- A pull request token has `sub` = `repo:<owner>/<repo>:pull_request`, which doesn't match.
-- If a job ever sets `environment:`, `sub` becomes `repo:<owner>/<repo>:environment:<name>`, and the condition has to change too.
+- `<sub-prefix>` is what GitHub reports for this repo. Get it with `gh api repos/<owner>/<repo>/actions/oidc/customization/sub` and read `sub_claim_prefix`.
+  - The classic form is `repo:<owner>/<repo>`.
+  - This repo has **immutable subject** turned on, so its prefix also carries the owner and repo IDs: `repo:Chrishhh9874@170212786/Internal_Agent@1413579455`.
+  - Writing the classic form when the repo uses immutable subject makes every push fail at Configure AWS credentials with `Not authorized to perform sts:AssumeRoleWithWebIdentity`. That is exactly what happened on the first merge (2026-11-27).
+- A pull request token has `sub` = `<sub-prefix>:pull_request`, which doesn't match.
+- If a job ever sets `environment:`, `sub` becomes `<sub-prefix>:environment:<name>`, and the condition has to change too.
 
 Permission policy, illustrative and put together from the notes:
 
@@ -511,7 +515,8 @@ Permission policy, illustrative and put together from the notes:
         "ecr:InitiateLayerUpload",
         "ecr:UploadLayerPart",
         "ecr:CompleteLayerUpload",
-        "ecr:PutImage"
+        "ecr:PutImage",
+        "ecr:BatchGetImage"
       ],
       "Resource": "arn:aws:ecr:<region>:<account-id>:repository/<ecr-repo>"
     },
@@ -526,6 +531,9 @@ Permission policy, illustrative and put together from the notes:
 
 - This is the only role that can be assumed from outside AWS, so it gets the tightest scope: a custom policy, not a managed one.
 - `ecr:GetAuthorizationToken` cannot be scoped to a resource, so its `Resource` has to be `"*"`.
+- `ecr:BatchGetImage` is in the list even though this role only pushes.
+  - Current Docker sends a `HEAD /v2/<repo>/manifests/<digest>` before writing each manifest, and ECR authorizes that request as `BatchGetImage`.
+  - Without it, every layer uploads and the push then fails with `403 Forbidden` on the manifest. This happened on the first real push, 2026-11-27.
 - Console steps:
   1. Create role → Web identity → the GitHub provider, with audience `sts.amazonaws.com`.
   2. Enter the GitHub owner, repo and branch. This step writes the trust policy.
@@ -559,7 +567,9 @@ The trust principal is `ec2.amazonaws.com`. Permission policy:
 ```
 
 - `s3:GetObject` needs the object ARN, `bucket/*`. The bare bucket ARN gives AccessDenied.
-- Both buckets get read access because, when the deployment comes through CodePipeline, the agent probably downloads the pipeline's copy of the bundle from the artifact bucket. This still has to be confirmed in the agent log ([Q5](#q5-which-bucket-the-agent-downloads-from)).
+- Both buckets get read access.
+  - Pipeline deployments download the pipeline's copy of the bundle from the **artifact bucket**. The first deployment confirmed this on 2026-11-27 ([Q5](#q5-which-bucket-the-agent-downloads-from)).
+  - The bundle-bucket grant is kept for manual redeploys straight from a bundle version, for example a rollback.
 - For v1, the notes allow starting with the managed policy `AmazonEC2ContainerRegistryReadOnly` plus S3 read. It is broader, but gets things working sooner. Tighten it to the policy above later.
 - The instance profile is what attaches the role to the instance; the console creates one with the same name. The agent and `aws ecr get-login-password` get credentials through IMDS, so no keys live on the instance.
 - Later, when the container itself uses the instance role (for example to read Secrets Manager), the IMDSv2 hop limit has to be 2 instead of 1, because Docker's bridge network adds a hop. v1 doesn't need this, since only processes on the host call AWS.
@@ -574,6 +584,7 @@ The trust principal is `ec2.amazonaws.com`. Permission policy:
 | Push | `BatchCheckLayerAvailability` | Ask which layers ECR already has |
 | Push | `InitiateLayerUpload`, `UploadLayerPart`, `CompleteLayerUpload` | Upload the missing layers |
 | Push | `PutImage` | Write the manifest and the tag |
+| Push | `BatchGetImage` | `HEAD` on a manifest to check whether it already exists, which current Docker does before writing it |
 
 ### Reading permission errors
 
@@ -673,6 +684,10 @@ Each step is checked by hand before the next one starts.
 6. **Run the pipeline end to end.**
    - Merge to `main`, then follow the run through Actions, S3, CodePipeline and CodeDeploy.
    - Done when the SHA shown by `docker ps` on EC2 matches the latest commit on `main`. Merge a second trivial change and check that the SHA moves again.
+   - **First run 2026-11-27 (merge `cd7472d`)**:
+     - Actions was green on the third attempt, after two IAM fixes: the immutable `sub` claim, and `ecr:BatchGetImage`.
+     - The pipeline was triggered by EventBridge 3 s after the S3 upload.
+     - Deployment `d-ARZ9NKQRL` passed every lifecycle event in 39 s, and the public health check returned 200.
 
 After v1, the mentor's order continues: make the hello-world API reachable from outside, then add a POST endpoint that receives a prompt, then build the rest of the system.
 
@@ -705,7 +720,9 @@ The security group opens SSH, HTTP and HTTPS, while uvicorn listens on 8000 insi
 
 #### Q5. Which bucket the agent downloads from
 
-When the deployment comes through CodePipeline, the agent probably downloads the pipeline's copy from the artifact bucket, not the original from the bundle bucket. The instance role can read both for now. Confirm in the agent log during step 6, then drop whichever grant is not needed.
+**Answered 2026-11-27.**
+- The first pipeline deployment (`d-ARZ9NKQRL`) took its revision from the CodePipeline artifact bucket (`codepipeline-us-east-2-…/internal-agent-pipel/SourceArti/…zip`), not from the bundle bucket. So the artifact-bucket grant on the instance role is required.
+- The bundle-bucket grant isn't used by pipeline deploys. It stays, so that a CodeDeploy deployment can be started by hand from an older `bundle.zip` version (the rollback path in §3). Drop it if that path is never used.
 
 #### Q6. CodeDeploy agent on Ubuntu 26.04
 
@@ -745,7 +762,7 @@ Older notes (2026-10-20, and the EC2 note) planned a manual deploy first: SSH, a
 | CodeDeploy deployment group name | `internal-agent-api` (proposed) | Pipeline Deploy stage |
 | CodePipeline name | `internal-agent-pipeline` (proposed) | |
 | EC2 tag key and value for the deployment group | `DeployGroup` = `internal-agent-api` (proposed) | Deployment group, the instance |
-| `<owner>/<repo>` | This GitHub repository | The trust policy's `sub` |
+| `<sub-prefix>` | `repo:Chrishhh9874@170212786/Internal_Agent@1413579455` (immutable subject is on for this repo) | The trust policy's `sub` |
 | `<account-id>` | Never written into repo docs | Role ARN, policies |
 | Python version | 3.12 (local venv uses Homebrew `python3.12`) | `Dockerfile`, workflow |
 | Host port | 80, mapped to container port 8000 (Q4) | `start.sh`, `validate.sh` |

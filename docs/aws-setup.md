@@ -69,7 +69,7 @@ It returned `arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercon
   - Identity provider `token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
   - GitHub organization: `<owner>`. Repository: `<repo>`. Branch: `main`.
 - [x] Skip the managed policies. Name it `internal-agent-github-actions` and create it.
-- [x] Open the role → Trust relationships. Check that the condition limits `sub` to `repo:<owner>/<repo>:ref:refs/heads/main`.
+- [x] Open the role → Trust relationships. Check that the condition limits `sub` to the main branch of this repo. Because this repo uses GitHub's **immutable subject** format, that is `repo:Chrishhh9874@170212786/Internal_Agent@1413579455:ref:refs/heads/main` (see the fix note below).
 
 Done 2026-11-27. This account's console has no **Web identity** option (only AWS service, AWS account and Custom trust policy), so the role was created with **Custom trust policy** and this JSON. No managed policies were attached.
 
@@ -85,12 +85,18 @@ Done 2026-11-27. This account's console has no **Web identity** option (only AWS
     "Condition": {
       "StringEquals": {
         "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-        "token.actions.githubusercontent.com:sub": "repo:Chrishhh9874/Internal_Agent:ref:refs/heads/main"
+        "token.actions.githubusercontent.com:sub": "repo:Chrishhh9874@170212786/Internal_Agent@1413579455:ref:refs/heads/main"
       }
     }
   }]
 }
 ```
+
+**Fix on 2026-11-27.** The role was first created with `sub` = `repo:Chrishhh9874/Internal_Agent:ref:refs/heads/main`. The first push to main then failed at Configure AWS credentials with `Not authorized to perform sts:AssumeRoleWithWebIdentity`.
+- Cause: the repo has GitHub's immutable OIDC subject turned on. Its `sub` embeds the owner and repo IDs, and `gh api repos/Chrishhh9874/Internal_Agent/actions/oidc/customization/sub` returns `"use_immutable_subject":true` with `"sub_claim_prefix":"repo:Chrishhh9874@170212786/Internal_Agent@1413579455"`.
+- Fix: edit the trust policy so `sub` uses that prefix, as shown above.
+- The IDs are public and not secrets. They keep the role safe even if the repo were deleted and someone recreated one with the same name.
+- If a future repo has this setting, read `sub_claim_prefix` first and build the condition from it.
 
 - [x] Permissions → Add permissions → Create inline policy → JSON. Name it `ecr-push-and-bundle-upload`. Fill in `<account-id>`. (Done 2026-11-27; shows as type Customer inline.)
 
@@ -106,7 +112,8 @@ Done 2026-11-27. This account's console has no **Web identity** option (only AWS
         "ecr:InitiateLayerUpload",
         "ecr:UploadLayerPart",
         "ecr:CompleteLayerUpload",
-        "ecr:PutImage"
+        "ecr:PutImage",
+        "ecr:BatchGetImage"
       ],
       "Resource": "arn:aws:ecr:us-east-2:<account-id>:repository/internal-agent-api"
     },
@@ -118,6 +125,11 @@ Done 2026-11-27. This account's console has no **Web identity** option (only AWS
   ]
 }
 ```
+
+**Fix on 2026-11-27: added `ecr:BatchGetImage`.** After the OIDC fix, the first real push uploaded every layer, then failed on `HEAD …/v2/internal-agent-api/manifests/sha256:… : 403 Forbidden`.
+- The runner's Docker checks whether each manifest already exists before writing it, and that HEAD request needs `ecr:BatchGetImage`.
+- The five classic push actions don't cover it.
+- `BatchGetImage` is read-only and scoped to this one repo.
 
 - [ ] Copy the role ARN for step 9. It goes into a GitHub variable, not into the repo.
 
@@ -257,15 +269,24 @@ Done 2026-11-27:
 
 ## 10. First pipeline run
 
-- [ ] Open a pull request. The run should show `test` and `build` (build plus smoke test) passing, with every AWS step skipped.
-- [ ] Merge it. Follow it through:
+- [x] Open a pull request. The run should show `test` and `build` (build plus smoke test) passing, with every AWS step skipped. (PR #2, 2026-11-27: green, all five AWS steps skipped.)
+- [x] Merge it. Follow it through. Merge commit `cd7472d`, 2026-11-27; it took two fixes before it went green, see step 3:
+  - Attempt 1 failed at Configure AWS credentials: the trust policy needed the immutable `sub` format.
+  - Attempt 2 failed at the manifest push with 403: the role needed `ecr:BatchGetImage`.
+  - Attempt 3 was green.
   - **Actions:** every step is green, and the log prints `IMAGE=…:<sha>`.
   - **S3:** `bundle.zip` has a new version.
   - **CodePipeline:** a new execution has started.
   - **CodeDeploy:** all lifecycle events succeed.
-- [ ] On EC2, the tag in `sudo docker ps` equals `git rev-parse origin/main`.
-- [ ] `curl http://<ec2-public-ip>/api/health` works.
+  - Observed on attempt 3:
+    - `bundle.zip` got a new S3 version at 07:18:58Z.
+    - Three seconds later the pipeline started (trigger `CloudWatchEvent`, the EventBridge rule) and Succeeded.
+    - Deployment `d-ARZ9NKQRL` took 39 s, with every lifecycle event Succeeded. ValidateService took about 3 s, so one retry.
+- [x] On EC2, the tag in `sudo docker ps` equals `git rev-parse origin/main`. (2026-11-27: `internal-agent-api:cd7472df4f86366eae896072c12b9b58dde127fe`, which replaced the rehearsal's `manual-test` container.)
+- [x] `curl http://<ec2-public-ip>/api/health` works. (HTTP 200 from the Mac after the deploy.)
 - [ ] Merge a second small change and check that the SHA on EC2 moves again.
-- [ ] Read the agent log to see which bucket the bundle was downloaded from (design Q5): `/opt/codedeploy-agent/deployment-root/deployment-logs/codedeploy-agent-deployments.log`.
+- [x] Read the agent log to see which bucket the bundle was downloaded from (design Q5): `/opt/codedeploy-agent/deployment-root/deployment-logs/codedeploy-agent-deployments.log`.
+  - Answered from the deployment itself: `aws deploy get-deployment` shows the revision at `codepipeline-us-east-2-d435ad8d1f6a-469a-b51b-1d4647b29822/internal-agent-pipel/SourceArti/…zip`.
+  - So pipeline deploys read the **artifact bucket**.
 
 If something fails, use the troubleshooting section in [ci-cd-design.md §9](ci-cd-design.md#9-verification-and-troubleshooting).
